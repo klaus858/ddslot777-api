@@ -2,11 +2,11 @@
   "rewrites": [
     {
       "source": "/api",
-      "destination": "/api/index.go"
+      "destination": "/index"
     },
     {
       "source": "/api/:path*",
-      "destination": "/api/index.go"
+      "destination": "/index"
     }
   ]
 }
