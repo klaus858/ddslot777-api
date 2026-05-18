@@ -45,12 +45,8 @@ var deposits = []deposit{
 
 func main() {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", withCORS(healthHandler))
-	mux.HandleFunc("/auth/login", withCORS(loginHandler))
-	mux.HandleFunc("/admin/summary", withCORS(requireToken(summaryHandler)))
-	mux.HandleFunc("/admin/members", withCORS(requireToken(membersHandler)))
-	mux.HandleFunc("/admin/deposits", withCORS(requireToken(depositsHandler)))
-	mux.HandleFunc("/admin/deposits/confirm", withCORS(requireToken(confirmDepositHandler)))
+	registerRoutes(mux, "")
+	registerRoutes(mux, "/api")
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -59,6 +55,15 @@ func main() {
 
 	log.Printf("ddslot777-api listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
+}
+
+func registerRoutes(mux *http.ServeMux, prefix string) {
+	mux.HandleFunc(prefix+"/health", withCORS(healthHandler))
+	mux.HandleFunc(prefix+"/auth/login", withCORS(loginHandler))
+	mux.HandleFunc(prefix+"/admin/summary", withCORS(requireToken(summaryHandler)))
+	mux.HandleFunc(prefix+"/admin/members", withCORS(requireToken(membersHandler)))
+	mux.HandleFunc(prefix+"/admin/deposits", withCORS(requireToken(depositsHandler)))
+	mux.HandleFunc(prefix+"/admin/deposits/confirm", withCORS(requireToken(confirmDepositHandler)))
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
