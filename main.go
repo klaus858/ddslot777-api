@@ -9,6 +9,12 @@ import (
 	"time"
 )
 
+const (
+	serviceName     = "ddslot777-api"
+	apiVersion      = "v1"
+	contractVersion = "admin-v1"
+)
+
 type response map[string]any
 
 type member struct {
@@ -53,12 +59,13 @@ func main() {
 		port = "8080"
 	}
 
-	log.Printf("ddslot777-api listening on :%s", port)
+	log.Printf("%s listening on :%s", serviceName, port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
 }
 
 func registerRoutes(mux *http.ServeMux, prefix string) {
 	mux.HandleFunc(prefix+"/health", withCORS(healthHandler))
+	mux.HandleFunc(prefix+"/contract", withCORS(contractHandler))
 	mux.HandleFunc(prefix+"/auth/login", withCORS(loginHandler))
 	mux.HandleFunc(prefix+"/admin/summary", withCORS(requireToken(summaryHandler)))
 	mux.HandleFunc(prefix+"/admin/members", withCORS(requireToken(membersHandler)))
@@ -68,9 +75,35 @@ func registerRoutes(mux *http.ServeMux, prefix string) {
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response{
-		"ok":      true,
-		"service": "ddslot777-api",
-		"time":    time.Now().UTC().Format(time.RFC3339),
+		"ok":              true,
+		"service":         serviceName,
+		"apiVersion":      apiVersion,
+		"contractVersion": contractVersion,
+		"time":            time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+func contractHandler(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, response{
+		"apiVersion":      apiVersion,
+		"contractVersion": contractVersion,
+		"auth": response{
+			"type":   "Bearer token",
+			"header": "Authorization: Bearer <token>",
+		},
+		"statusValues": response{
+			"member":  []string{"normal", "risk_review"},
+			"deposit": []string{"pending", "credited", "risk_review"},
+		},
+		"endpoints": []response{
+			{"method": "GET", "path": "/api/health", "auth": false},
+			{"method": "GET", "path": "/api/contract", "auth": false},
+			{"method": "POST", "path": "/api/auth/login", "auth": false},
+			{"method": "GET", "path": "/api/admin/summary", "auth": true},
+			{"method": "GET", "path": "/api/admin/members", "auth": true},
+			{"method": "GET", "path": "/api/admin/deposits", "auth": true},
+			{"method": "POST", "path": "/api/admin/deposits/confirm", "auth": true},
+		},
 	})
 }
 
