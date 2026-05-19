@@ -9,7 +9,7 @@ Live API:
 Contract:
 
 - API version: `v1`
-- Admin contract version: `admin-mvp-v2`
+- Admin contract version: `admin-mvp-v3`
 - Contract endpoint: `GET /api/contract`
 - Storage: Postgres when `DATABASE_URL` is configured, temporary memory fallback otherwise.
 
@@ -20,6 +20,8 @@ Current endpoints:
 - `GET /api/wallet/session`
 - `POST /api/wallet/deposit/success`
 - `POST /api/auth/login`
+- `POST /api/auth/register`
+- `GET /api/auth/me`
 - `GET /api/admin/summary`
 - `GET /api/admin/users`
 - `GET /api/admin/members`
@@ -46,10 +48,38 @@ Successful login returns a Bearer token. Protected endpoints require:
 Authorization: Bearer demo-admin-token
 ```
 
+Demo player accounts:
+
+- `player123@ddslot777.com` / `Demo123`
+- `5550001001` / `Demo123`
+
+Player login payload:
+
+```json
+{
+  "identifier": "player123@ddslot777.com",
+  "password": "Demo123"
+}
+```
+
+Player register payload:
+
+```json
+{
+  "phone": "5551234567",
+  "password": "Aa1234"
+}
+```
+
+Successful player login/register returns a Bearer token such as `demo-player-U10021`.
+The frontend should store that token and call `GET /api/auth/me` to sync the current user and balance.
+Wallet session and deposit callback endpoints require the same player Bearer token.
+
 Phase 1 admin loop:
 
 - Admin login
 - User list
+- Player register/login and frontend auth state
 - Frontend wallet deposit callback synced to user balance and deposit orders
 - Deposit order list and confirm deposit
 - Withdrawal order list and approve/reject withdrawal
