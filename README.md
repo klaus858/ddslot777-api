@@ -16,6 +16,8 @@ Current endpoints:
 
 - `GET /api/health`
 - `GET /api/contract`
+- `GET /api/wallet/session`
+- `POST /api/wallet/deposit/success`
 - `POST /api/auth/login`
 - `GET /api/admin/summary`
 - `GET /api/admin/users`
@@ -47,6 +49,7 @@ Phase 1 admin loop:
 
 - Admin login
 - User list
+- Frontend wallet deposit callback synced to user balance and deposit orders
 - Deposit order list and confirm deposit
 - Withdrawal order list and approve/reject withdrawal
 - Manual user balance update
