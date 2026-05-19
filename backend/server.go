@@ -138,6 +138,10 @@ func (s *store) route(w http.ResponseWriter, r *http.Request) {
 		s.requireToken(w, r, s.rejectWithdrawal)
 	case "/admin/audit-logs", "/api/admin/audit-logs":
 		s.requireToken(w, r, s.auditLogs)
+	case "/wallet/session", "/api/wallet/session":
+		s.walletSession(w, r)
+	case "/wallet/deposit/success", "/api/wallet/deposit/success":
+		s.walletDepositSuccess(w, r)
 	default:
 		writeJSON(w, http.StatusNotFound, response{"error": "not_found", "path": r.URL.Path})
 	}
@@ -163,6 +167,8 @@ func (s *store) contract(w http.ResponseWriter) {
 			"withdrawal": []string{"pending", "approved", "rejected"},
 		},
 		"endpoints": []response{
+			{"method": "GET", "path": "/api/wallet/session", "auth": false},
+			{"method": "POST", "path": "/api/wallet/deposit/success", "auth": false},
 			{"method": "POST", "path": "/api/auth/login", "auth": false},
 			{"method": "GET", "path": "/api/admin/summary", "auth": true},
 			{"method": "GET", "path": "/api/admin/users", "auth": true},
@@ -361,6 +367,94 @@ func (s *store) auditLogs(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	writeJSON(w, http.StatusOK, response{"items": append([]auditLog(nil), s.logs...)})
+}
+
+func (s *store) walletSession(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("userId")
+	if userID == "" {
+		userID = "U10021"
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, item := range s.users {
+		if item.ID == userID {
+			writeJSON(w, http.StatusOK, response{
+				"ok":   true,
+				"user": item,
+			})
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusNotFound, response{"error": "user_not_found"})
+}
+
+func (s *store) walletDepositSuccess(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, response{"error": "method_not_allowed"})
+		return
+	}
+
+	var payload struct {
+		UserID  string  `json:"userId"`
+		Amount  float64 `json:"amount"`
+		Channel string  `json:"channel"`
+		Order   string  `json:"order"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, response{"error": "invalid_json"})
+		return
+	}
+	if payload.UserID == "" {
+		payload.UserID = "U10021"
+	}
+	if payload.Amount <= 0 {
+		writeJSON(w, http.StatusBadRequest, response{"error": "invalid_amount"})
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var creditedUser *user
+	for i := range s.users {
+		if s.users[i].ID == payload.UserID {
+			s.users[i].Balance += payload.Amount
+			creditedUser = &s.users[i]
+			break
+		}
+	}
+	if creditedUser == nil {
+		writeJSON(w, http.StatusNotFound, response{"error": "user_not_found"})
+		return
+	}
+
+	if payload.Channel == "" {
+		payload.Channel = "demo-wallet"
+	}
+	if payload.Order == "" {
+		payload.Order = "D" + time.Now().UTC().Format("20060102150405")
+	}
+
+	entry := deposit{
+		Order:   payload.Order,
+		UserID:  payload.UserID,
+		User:    creditedUser.Name,
+		Amount:  payload.Amount,
+		Channel: payload.Channel,
+		State:   "credited",
+		Time:    time.Now().Format("15:04"),
+	}
+	s.deposits = append([]deposit{entry}, s.deposits...)
+	s.addLogLocked("wallet", "deposit_success", payload.Order, creditedUser.Name+" "+money(payload.Amount)+" via "+payload.Channel)
+
+	writeJSON(w, http.StatusOK, response{
+		"ok":      true,
+		"deposit": entry,
+		"user":    *creditedUser,
+		"balance": creditedUser.Balance,
+	})
 }
 
 func (s *store) requireToken(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
