@@ -9,8 +9,9 @@ Live API:
 Contract:
 
 - API version: `v1`
-- Admin contract version: `admin-mvp-v1`
+- Admin contract version: `admin-mvp-v2`
 - Contract endpoint: `GET /api/contract`
+- Storage: Postgres when `DATABASE_URL` is configured, temporary memory fallback otherwise.
 
 Current endpoints:
 
@@ -55,10 +56,17 @@ Phase 1 admin loop:
 - Manual user balance update
 - Simple operation/audit log
 
+Database setup:
+
+- Create a Postgres database, for example Vercel Postgres, Neon, or Supabase.
+- Add the connection string to the `ddslot777-api` Vercel project as `DATABASE_URL`.
+- Redeploy the API. On boot, the API creates `users`, `deposits`, `withdrawals`, and `audit_logs` tables automatically.
+- `GET /api/health` returns `"storage":"postgres"` when the database is active.
+
 Sync rule:
 
 - `ddslot777-admin` must read lists from this API only.
 - After every write action, the admin UI should reload summary, users, deposits, withdrawals, and audit logs from the API.
 - If the API is unavailable, the admin UI should show an error instead of local fallback data.
 
-This is still a demo API backed by in-memory data. Database persistence, real authentication, payment callbacks, balance ledger entries, and durable audit logs should be added before production use.
+This is still a demo API. Real authentication, payment callbacks, balance ledger entries, and stricter audit controls should be added before production use.
