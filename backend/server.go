@@ -1,18 +1,24 @@
 package backend
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
 	ServiceName     = "ddslot777-api"
 	APIVersion      = "v1"
-	ContractVersion = "admin-mvp-v1"
+	ContractVersion = "admin-mvp-v2"
 	adminToken       = "demo-admin-token"
 )
 
@@ -61,6 +67,8 @@ type auditLog struct {
 
 type store struct {
 	mu          sync.Mutex
+	db          *pgxpool.Pool
+	dbErr       string
 	users       []user
 	deposits    []deposit
 	withdrawals []withdrawal
@@ -69,6 +77,8 @@ type store struct {
 
 func NewHandler() http.Handler {
 	s := newDemoStore()
+	s.connectDatabase()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.route)
 	return mux
@@ -99,6 +109,128 @@ func newDemoStore() *store {
 			{ID: "L10001", Actor: "admin", Action: "login", Target: "admin", Detail: "Admin login succeeded", Time: "2026-05-19 12:30:00"},
 		},
 	}
+}
+
+func (s *store) connectDatabase() {
+	databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	if databaseURL == "" {
+		s.dbErr = "DATABASE_URL is not configured; using temporary memory store"
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		s.dbErr = "database_pool_error: " + err.Error()
+		log.Print(s.dbErr)
+		return
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		s.dbErr = "database_ping_error: " + err.Error()
+		log.Print(s.dbErr)
+		return
+	}
+
+	s.db = pool
+	if err := s.migrate(ctx); err != nil {
+		pool.Close()
+		s.db = nil
+		s.dbErr = "database_migration_error: " + err.Error()
+		log.Print(s.dbErr)
+		return
+	}
+
+	s.dbErr = ""
+}
+
+func (s *store) migrate(ctx context.Context) error {
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS users (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			username TEXT NOT NULL,
+			balance NUMERIC(14,2) NOT NULL DEFAULT 0,
+			vip TEXT NOT NULL,
+			status TEXT NOT NULL,
+			last_login TEXT NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS deposits (
+			order_id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL REFERENCES users(id),
+			user_name TEXT NOT NULL,
+			amount NUMERIC(14,2) NOT NULL,
+			channel TEXT NOT NULL,
+			state TEXT NOT NULL,
+			time_label TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS withdrawals (
+			order_id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL REFERENCES users(id),
+			user_name TEXT NOT NULL,
+			amount NUMERIC(14,2) NOT NULL,
+			channel TEXT NOT NULL,
+			address TEXT NOT NULL,
+			state TEXT NOT NULL,
+			time_label TEXT NOT NULL,
+			reason TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS audit_logs (
+			id TEXT PRIMARY KEY,
+			actor TEXT NOT NULL,
+			action TEXT NOT NULL,
+			target TEXT NOT NULL,
+			detail TEXT NOT NULL,
+			time_label TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS deposits_created_at_idx ON deposits(created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS withdrawals_created_at_idx ON withdrawals(created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS audit_logs_created_at_idx ON audit_logs(created_at DESC)`,
+	}
+	for _, statement := range statements {
+		if _, err := s.db.Exec(ctx, statement); err != nil {
+			return err
+		}
+	}
+
+	for _, item := range s.users {
+		if _, err := s.db.Exec(ctx, `INSERT INTO users (id, name, username, balance, vip, status, last_login)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (id) DO NOTHING`, item.ID, item.Name, item.Username, item.Balance, item.VIP, item.Status, item.LastLogin); err != nil {
+			return err
+		}
+	}
+	for _, item := range s.deposits {
+		if _, err := s.db.Exec(ctx, `INSERT INTO deposits (order_id, user_id, user_name, amount, channel, state, time_label)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (order_id) DO NOTHING`, item.Order, item.UserID, item.User, item.Amount, item.Channel, item.State, item.Time); err != nil {
+			return err
+		}
+	}
+	for _, item := range s.withdrawals {
+		if _, err := s.db.Exec(ctx, `INSERT INTO withdrawals (order_id, user_id, user_name, amount, channel, address, state, time_label, reason)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			ON CONFLICT (order_id) DO NOTHING`, item.Order, item.UserID, item.User, item.Amount, item.Channel, item.Address, item.State, item.Time, item.Reason); err != nil {
+			return err
+		}
+	}
+	for _, item := range s.logs {
+		if _, err := s.db.Exec(ctx, `INSERT INTO audit_logs (id, actor, action, target, detail, time_label)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (id) DO NOTHING`, item.ID, item.Actor, item.Action, item.Target, item.Detail, item.Time); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (s *store) route(w http.ResponseWriter, r *http.Request) {
@@ -148,19 +280,25 @@ func (s *store) route(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *store) health(w http.ResponseWriter) {
-	writeJSON(w, http.StatusOK, response{
+	payload := response{
 		"ok":              true,
 		"service":         ServiceName,
 		"apiVersion":      APIVersion,
 		"contractVersion": ContractVersion,
+		"storage":         s.storageMode(),
 		"time":            time.Now().UTC().Format(time.RFC3339),
-	})
+	}
+	if s.dbErr != "" {
+		payload["storageWarning"] = s.dbErr
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *store) contract(w http.ResponseWriter) {
 	writeJSON(w, http.StatusOK, response{
 		"apiVersion":      APIVersion,
 		"contractVersion": ContractVersion,
+		"storage":         s.storageMode(),
 		"statusValues": response{
 			"user":       []string{"normal", "risk_review", "disabled"},
 			"deposit":    []string{"pending", "credited", "risk_review"},
@@ -207,6 +345,11 @@ func (s *store) login(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *store) summary(w http.ResponseWriter, r *http.Request) {
+	if s.db != nil {
+		s.dbSummary(w, r)
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -221,18 +364,11 @@ func (s *store) summary(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	pendingWithdrawals := 0
-	for _, item := range s.withdrawals {
-		if item.State == "pending" {
-			pendingWithdrawals++
-		}
-	}
-
 	writeJSON(w, http.StatusOK, response{
 		"todayDeposit":       todayDeposit,
 		"pendingDeposits":    pendingDeposits,
-		"pendingWithdrawals": pendingWithdrawals,
-		"pendingWithdraws":   pendingWithdrawals,
+		"pendingWithdrawals": countPendingWithdrawals(s.withdrawals),
+		"pendingWithdraws":   countPendingWithdrawals(s.withdrawals),
 		"newMembers":         len(s.users),
 		"totalUsers":         len(s.users),
 		"activityClaims":     384,
@@ -240,6 +376,11 @@ func (s *store) summary(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *store) usersList(w http.ResponseWriter, r *http.Request) {
+	if s.db != nil {
+		s.dbUsersList(w, r)
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	writeJSON(w, http.StatusOK, response{"items": append([]user(nil), s.users...)})
@@ -248,6 +389,10 @@ func (s *store) usersList(w http.ResponseWriter, r *http.Request) {
 func (s *store) updateBalance(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, response{"error": "method_not_allowed"})
+		return
+	}
+	if s.db != nil {
+		s.dbUpdateBalance(w, r)
 		return
 	}
 
@@ -276,6 +421,11 @@ func (s *store) updateBalance(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *store) depositsList(w http.ResponseWriter, r *http.Request) {
+	if s.db != nil {
+		s.dbDepositsList(w, r)
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	writeJSON(w, http.StatusOK, response{"items": append([]deposit(nil), s.deposits...)})
@@ -284,6 +434,10 @@ func (s *store) depositsList(w http.ResponseWriter, r *http.Request) {
 func (s *store) confirmDeposit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, response{"error": "method_not_allowed"})
+		return
+	}
+	if s.db != nil {
+		s.dbConfirmDeposit(w, r)
 		return
 	}
 
@@ -317,6 +471,11 @@ func (s *store) confirmDeposit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *store) withdrawalsList(w http.ResponseWriter, r *http.Request) {
+	if s.db != nil {
+		s.dbWithdrawalsList(w, r)
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	writeJSON(w, http.StatusOK, response{"items": append([]withdrawal(nil), s.withdrawals...)})
@@ -333,6 +492,10 @@ func (s *store) rejectWithdrawal(w http.ResponseWriter, r *http.Request) {
 func (s *store) setWithdrawalState(w http.ResponseWriter, r *http.Request, state string) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, response{"error": "method_not_allowed"})
+		return
+	}
+	if s.db != nil {
+		s.dbSetWithdrawalState(w, r, state)
 		return
 	}
 
@@ -364,12 +527,22 @@ func (s *store) setWithdrawalState(w http.ResponseWriter, r *http.Request, state
 }
 
 func (s *store) auditLogs(w http.ResponseWriter, r *http.Request) {
+	if s.db != nil {
+		s.dbAuditLogs(w, r)
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	writeJSON(w, http.StatusOK, response{"items": append([]auditLog(nil), s.logs...)})
 }
 
 func (s *store) walletSession(w http.ResponseWriter, r *http.Request) {
+	if s.db != nil {
+		s.dbWalletSession(w, r)
+		return
+	}
+
 	userID := r.URL.Query().Get("userId")
 	if userID == "" {
 		userID = "U10021"
@@ -379,10 +552,7 @@ func (s *store) walletSession(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 	for _, item := range s.users {
 		if item.ID == userID {
-			writeJSON(w, http.StatusOK, response{
-				"ok":   true,
-				"user": item,
-			})
+			writeJSON(w, http.StatusOK, response{"ok": true, "user": item})
 			return
 		}
 	}
@@ -393,6 +563,10 @@ func (s *store) walletSession(w http.ResponseWriter, r *http.Request) {
 func (s *store) walletDepositSuccess(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, response{"error": "method_not_allowed"})
+		return
+	}
+	if s.db != nil {
+		s.dbWalletDepositSuccess(w, r)
 		return
 	}
 
@@ -417,19 +591,324 @@ func (s *store) walletDepositSuccess(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var creditedUser *user
 	for i := range s.users {
 		if s.users[i].ID == payload.UserID {
 			s.users[i].Balance += payload.Amount
-			creditedUser = &s.users[i]
-			break
+			if payload.Channel == "" {
+				payload.Channel = "demo-wallet"
+			}
+			if payload.Order == "" {
+				payload.Order = "D" + time.Now().UTC().Format("20060102150405")
+			}
+			entry := deposit{Order: payload.Order, UserID: payload.UserID, User: s.users[i].Name, Amount: payload.Amount, Channel: payload.Channel, State: "credited", Time: time.Now().Format("15:04")}
+			s.deposits = append([]deposit{entry}, s.deposits...)
+			s.addLogLocked("wallet", "deposit_success", payload.Order, s.users[i].Name+" "+money(payload.Amount)+" via "+payload.Channel)
+			writeJSON(w, http.StatusOK, response{"ok": true, "deposit": entry, "user": s.users[i], "balance": s.users[i].Balance})
+			return
 		}
 	}
-	if creditedUser == nil {
-		writeJSON(w, http.StatusNotFound, response{"error": "user_not_found"})
+
+	writeJSON(w, http.StatusNotFound, response{"error": "user_not_found"})
+}
+
+func (s *store) dbSummary(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := requestContext(r)
+	defer cancel()
+
+	var todayDeposit float64
+	var pendingDeposits int
+	var pendingWithdrawals int
+	var totalUsers int
+	if err := s.db.QueryRow(ctx, `SELECT COALESCE(SUM(amount) FILTER (WHERE state = 'credited'), 0)::float8, COUNT(*) FILTER (WHERE state = 'pending') FROM deposits`).Scan(&todayDeposit, &pendingDeposits); err != nil {
+		writeServerError(w, err)
+		return
+	}
+	if err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM withdrawals WHERE state = 'pending'`).Scan(&pendingWithdrawals); err != nil {
+		writeServerError(w, err)
+		return
+	}
+	if err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM users`).Scan(&totalUsers); err != nil {
+		writeServerError(w, err)
 		return
 	}
 
+	writeJSON(w, http.StatusOK, response{
+		"todayDeposit":       todayDeposit,
+		"pendingDeposits":    pendingDeposits,
+		"pendingWithdrawals": pendingWithdrawals,
+		"pendingWithdraws":   pendingWithdrawals,
+		"newMembers":         totalUsers,
+		"totalUsers":         totalUsers,
+		"activityClaims":     384,
+	})
+}
+
+func (s *store) dbUsersList(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := requestContext(r)
+	defer cancel()
+
+	rows, err := s.db.Query(ctx, `SELECT id, name, username, balance::float8, vip, status, last_login FROM users ORDER BY id`)
+	if err != nil {
+		writeServerError(w, err)
+		return
+	}
+	defer rows.Close()
+
+	items := []user{}
+	for rows.Next() {
+		var item user
+		if err := rows.Scan(&item.ID, &item.Name, &item.Username, &item.Balance, &item.VIP, &item.Status, &item.LastLogin); err != nil {
+			writeServerError(w, err)
+			return
+		}
+		items = append(items, item)
+	}
+	writeJSON(w, http.StatusOK, response{"items": items})
+}
+
+func (s *store) dbUpdateBalance(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		UserID  string  `json:"userId"`
+		Balance float64 `json:"balance"`
+		Reason  string  `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, response{"error": "invalid_json"})
+		return
+	}
+
+	ctx, cancel := requestContext(r)
+	defer cancel()
+
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		writeServerError(w, err)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	var oldBalance float64
+	if err := tx.QueryRow(ctx, `SELECT balance::float8 FROM users WHERE id = $1 FOR UPDATE`, payload.UserID).Scan(&oldBalance); err != nil {
+		writeNotFoundOrServerError(w, err, "user_not_found")
+		return
+	}
+
+	var item user
+	err = tx.QueryRow(ctx, `UPDATE users SET balance = $2, updated_at = NOW() WHERE id = $1 RETURNING id, name, username, balance::float8, vip, status, last_login`, payload.UserID, payload.Balance).Scan(&item.ID, &item.Name, &item.Username, &item.Balance, &item.VIP, &item.Status, &item.LastLogin)
+	if err != nil {
+		writeServerError(w, err)
+		return
+	}
+	if err := insertAuditTx(ctx, tx, "admin", "update_balance", payload.UserID, money(oldBalance)+" -> "+money(payload.Balance)+" "+payload.Reason); err != nil {
+		writeServerError(w, err)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		writeServerError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, response{"ok": true, "user": item})
+}
+
+func (s *store) dbDepositsList(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := requestContext(r)
+	defer cancel()
+
+	rows, err := s.db.Query(ctx, `SELECT order_id, user_id, user_name, amount::float8, channel, state, time_label FROM deposits ORDER BY created_at DESC, order_id DESC`)
+	if err != nil {
+		writeServerError(w, err)
+		return
+	}
+	defer rows.Close()
+
+	items := []deposit{}
+	for rows.Next() {
+		var item deposit
+		if err := rows.Scan(&item.Order, &item.UserID, &item.User, &item.Amount, &item.Channel, &item.State, &item.Time); err != nil {
+			writeServerError(w, err)
+			return
+		}
+		items = append(items, item)
+	}
+	writeJSON(w, http.StatusOK, response{"items": items})
+}
+
+func (s *store) dbConfirmDeposit(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		Order string `json:"order"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, response{"error": "invalid_json"})
+		return
+	}
+
+	ctx, cancel := requestContext(r)
+	defer cancel()
+
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		writeServerError(w, err)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	item, err := selectDepositTx(ctx, tx, payload.Order, true)
+	if err != nil {
+		writeNotFoundOrServerError(w, err, "deposit_not_found")
+		return
+	}
+	if item.State != "credited" {
+		if _, err := tx.Exec(ctx, `UPDATE users SET balance = balance + $2, updated_at = NOW() WHERE id = $1`, item.UserID, item.Amount); err != nil {
+			writeServerError(w, err)
+			return
+		}
+		if _, err := tx.Exec(ctx, `UPDATE deposits SET state = 'credited', updated_at = NOW() WHERE order_id = $1`, item.Order); err != nil {
+			writeServerError(w, err)
+			return
+		}
+		item.State = "credited"
+	}
+	if err := insertAuditTx(ctx, tx, "admin", "confirm_deposit", item.Order, "Credited "+money(item.Amount)+" to "+item.User); err != nil {
+		writeServerError(w, err)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		writeServerError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, response{"ok": true, "deposit": item})
+}
+
+func (s *store) dbWithdrawalsList(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := requestContext(r)
+	defer cancel()
+
+	rows, err := s.db.Query(ctx, `SELECT order_id, user_id, user_name, amount::float8, channel, address, state, time_label, reason FROM withdrawals ORDER BY created_at DESC, order_id DESC`)
+	if err != nil {
+		writeServerError(w, err)
+		return
+	}
+	defer rows.Close()
+
+	items := []withdrawal{}
+	for rows.Next() {
+		var item withdrawal
+		if err := rows.Scan(&item.Order, &item.UserID, &item.User, &item.Amount, &item.Channel, &item.Address, &item.State, &item.Time, &item.Reason); err != nil {
+			writeServerError(w, err)
+			return
+		}
+		items = append(items, item)
+	}
+	writeJSON(w, http.StatusOK, response{"items": items})
+}
+
+func (s *store) dbSetWithdrawalState(w http.ResponseWriter, r *http.Request, state string) {
+	var payload struct {
+		Order  string `json:"order"`
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, response{"error": "invalid_json"})
+		return
+	}
+
+	ctx, cancel := requestContext(r)
+	defer cancel()
+
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		writeServerError(w, err)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	item, err := selectWithdrawalTx(ctx, tx, payload.Order, true)
+	if err != nil {
+		writeNotFoundOrServerError(w, err, "withdrawal_not_found")
+		return
+	}
+	if item.State != "pending" {
+		writeJSON(w, http.StatusConflict, response{"error": "withdrawal_already_processed"})
+		return
+	}
+
+	err = tx.QueryRow(ctx, `UPDATE withdrawals SET state = $2, reason = $3, updated_at = NOW() WHERE order_id = $1 RETURNING order_id, user_id, user_name, amount::float8, channel, address, state, time_label, reason`, payload.Order, state, payload.Reason).Scan(&item.Order, &item.UserID, &item.User, &item.Amount, &item.Channel, &item.Address, &item.State, &item.Time, &item.Reason)
+	if err != nil {
+		writeServerError(w, err)
+		return
+	}
+	if err := insertAuditTx(ctx, tx, "admin", state+"_withdrawal", item.Order, item.User+" "+money(item.Amount)+" "+payload.Reason); err != nil {
+		writeServerError(w, err)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		writeServerError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, response{"ok": true, "withdrawal": item})
+}
+
+func (s *store) dbAuditLogs(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := requestContext(r)
+	defer cancel()
+
+	rows, err := s.db.Query(ctx, `SELECT id, actor, action, target, detail, time_label FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT 80`)
+	if err != nil {
+		writeServerError(w, err)
+		return
+	}
+	defer rows.Close()
+
+	items := []auditLog{}
+	for rows.Next() {
+		var item auditLog
+		if err := rows.Scan(&item.ID, &item.Actor, &item.Action, &item.Target, &item.Detail, &item.Time); err != nil {
+			writeServerError(w, err)
+			return
+		}
+		items = append(items, item)
+	}
+	writeJSON(w, http.StatusOK, response{"items": items})
+}
+
+func (s *store) dbWalletSession(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("userId")
+	if userID == "" {
+		userID = "U10021"
+	}
+
+	ctx, cancel := requestContext(r)
+	defer cancel()
+
+	item, err := selectUser(ctx, s.db, userID)
+	if err != nil {
+		writeNotFoundOrServerError(w, err, "user_not_found")
+		return
+	}
+	writeJSON(w, http.StatusOK, response{"ok": true, "user": item})
+}
+
+func (s *store) dbWalletDepositSuccess(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		UserID  string  `json:"userId"`
+		Amount  float64 `json:"amount"`
+		Channel string  `json:"channel"`
+		Order   string  `json:"order"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, response{"error": "invalid_json"})
+		return
+	}
+	if payload.UserID == "" {
+		payload.UserID = "U10021"
+	}
+	if payload.Amount <= 0 {
+		writeJSON(w, http.StatusBadRequest, response{"error": "invalid_amount"})
+		return
+	}
 	if payload.Channel == "" {
 		payload.Channel = "demo-wallet"
 	}
@@ -437,24 +916,95 @@ func (s *store) walletDepositSuccess(w http.ResponseWriter, r *http.Request) {
 		payload.Order = "D" + time.Now().UTC().Format("20060102150405")
 	}
 
+	ctx, cancel := requestContext(r)
+	defer cancel()
+
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		writeServerError(w, err)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	item, err := selectUserTx(ctx, tx, payload.UserID, true)
+	if err != nil {
+		writeNotFoundOrServerError(w, err, "user_not_found")
+		return
+	}
+
+	err = tx.QueryRow(ctx, `UPDATE users SET balance = balance + $2, updated_at = NOW() WHERE id = $1 RETURNING id, name, username, balance::float8, vip, status, last_login`, payload.UserID, payload.Amount).Scan(&item.ID, &item.Name, &item.Username, &item.Balance, &item.VIP, &item.Status, &item.LastLogin)
+	if err != nil {
+		writeServerError(w, err)
+		return
+	}
+
 	entry := deposit{
 		Order:   payload.Order,
 		UserID:  payload.UserID,
-		User:    creditedUser.Name,
+		User:    item.Name,
 		Amount:  payload.Amount,
 		Channel: payload.Channel,
 		State:   "credited",
 		Time:    time.Now().Format("15:04"),
 	}
-	s.deposits = append([]deposit{entry}, s.deposits...)
-	s.addLogLocked("wallet", "deposit_success", payload.Order, creditedUser.Name+" "+money(payload.Amount)+" via "+payload.Channel)
+	if _, err := tx.Exec(ctx, `INSERT INTO deposits (order_id, user_id, user_name, amount, channel, state, time_label)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (order_id) DO UPDATE SET state = EXCLUDED.state, amount = EXCLUDED.amount, updated_at = NOW()`, entry.Order, entry.UserID, entry.User, entry.Amount, entry.Channel, entry.State, entry.Time); err != nil {
+		writeServerError(w, err)
+		return
+	}
+	if err := insertAuditTx(ctx, tx, "wallet", "deposit_success", payload.Order, item.Name+" "+money(payload.Amount)+" via "+payload.Channel); err != nil {
+		writeServerError(w, err)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		writeServerError(w, err)
+		return
+	}
 
-	writeJSON(w, http.StatusOK, response{
-		"ok":      true,
-		"deposit": entry,
-		"user":    *creditedUser,
-		"balance": creditedUser.Balance,
-	})
+	writeJSON(w, http.StatusOK, response{"ok": true, "deposit": entry, "user": item, "balance": item.Balance})
+}
+
+func selectUser(ctx context.Context, db *pgxpool.Pool, userID string) (user, error) {
+	var item user
+	err := db.QueryRow(ctx, `SELECT id, name, username, balance::float8, vip, status, last_login FROM users WHERE id = $1`, userID).Scan(&item.ID, &item.Name, &item.Username, &item.Balance, &item.VIP, &item.Status, &item.LastLogin)
+	return item, err
+}
+
+func selectUserTx(ctx context.Context, tx pgx.Tx, userID string, forUpdate bool) (user, error) {
+	var item user
+	query := `SELECT id, name, username, balance::float8, vip, status, last_login FROM users WHERE id = $1`
+	if forUpdate {
+		query += ` FOR UPDATE`
+	}
+	err := tx.QueryRow(ctx, query, userID).Scan(&item.ID, &item.Name, &item.Username, &item.Balance, &item.VIP, &item.Status, &item.LastLogin)
+	return item, err
+}
+
+func selectDepositTx(ctx context.Context, tx pgx.Tx, order string, forUpdate bool) (deposit, error) {
+	var item deposit
+	query := `SELECT order_id, user_id, user_name, amount::float8, channel, state, time_label FROM deposits WHERE order_id = $1`
+	if forUpdate {
+		query += ` FOR UPDATE`
+	}
+	err := tx.QueryRow(ctx, query, order).Scan(&item.Order, &item.UserID, &item.User, &item.Amount, &item.Channel, &item.State, &item.Time)
+	return item, err
+}
+
+func selectWithdrawalTx(ctx context.Context, tx pgx.Tx, order string, forUpdate bool) (withdrawal, error) {
+	var item withdrawal
+	query := `SELECT order_id, user_id, user_name, amount::float8, channel, address, state, time_label, reason FROM withdrawals WHERE order_id = $1`
+	if forUpdate {
+		query += ` FOR UPDATE`
+	}
+	err := tx.QueryRow(ctx, query, order).Scan(&item.Order, &item.UserID, &item.User, &item.Amount, &item.Channel, &item.Address, &item.State, &item.Time, &item.Reason)
+	return item, err
+}
+
+func insertAuditTx(ctx context.Context, tx pgx.Tx, actor string, action string, target string, detail string) error {
+	_, err := tx.Exec(ctx, `INSERT INTO audit_logs (id, actor, action, target, detail, time_label)
+		VALUES ($1, $2, $3, $4, $5, $6)`, logID(), actor, action, target, detail, time.Now().Format("2006-01-02 15:04:05"))
+	return err
 }
 
 func (s *store) requireToken(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
@@ -467,6 +1017,14 @@ func (s *store) requireToken(w http.ResponseWriter, r *http.Request, next http.H
 }
 
 func (s *store) addLog(actor string, action string, target string, detail string) {
+	if s.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = s.db.Exec(ctx, `INSERT INTO audit_logs (id, actor, action, target, detail, time_label)
+			VALUES ($1, $2, $3, $4, $5, $6)`, logID(), actor, action, target, detail, time.Now().Format("2006-01-02 15:04:05"))
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.addLogLocked(actor, action, target, detail)
@@ -474,7 +1032,7 @@ func (s *store) addLog(actor string, action string, target string, detail string
 
 func (s *store) addLogLocked(actor string, action string, target string, detail string) {
 	entry := auditLog{
-		ID:     "L" + time.Now().UTC().Format("20060102150405"),
+		ID:     logID(),
 		Actor:  actor,
 		Action: action,
 		Target: target,
@@ -487,8 +1045,45 @@ func (s *store) addLogLocked(actor string, action string, target string, detail 
 	}
 }
 
+func countPendingWithdrawals(items []withdrawal) int {
+	count := 0
+	for _, item := range items {
+		if item.State == "pending" {
+			count++
+		}
+	}
+	return count
+}
+
+func requestContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(r.Context(), 8*time.Second)
+}
+
+func logID() string {
+	return fmt.Sprintf("L%d", time.Now().UTC().UnixNano())
+}
+
 func money(value float64) string {
 	return fmt.Sprintf("$%.2f", value)
+}
+
+func (s *store) storageMode() string {
+	if s.db != nil {
+		return "postgres"
+	}
+	return "memory"
+}
+
+func writeNotFoundOrServerError(w http.ResponseWriter, err error, notFound string) {
+	if err == pgx.ErrNoRows {
+		writeJSON(w, http.StatusNotFound, response{"error": notFound})
+		return
+	}
+	writeServerError(w, err)
+}
+
+func writeServerError(w http.ResponseWriter, err error) {
+	writeJSON(w, http.StatusInternalServerError, response{"error": "server_error", "detail": err.Error()})
 }
 
 func withCORS(w http.ResponseWriter, r *http.Request) {
