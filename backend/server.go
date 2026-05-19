@@ -19,7 +19,7 @@ const (
 	ServiceName     = "ddslot777-api"
 	APIVersion      = "v1"
 	ContractVersion = "admin-mvp-v2"
-	adminToken       = "demo-admin-token"
+	adminToken      = "demo-admin-token"
 )
 
 type response map[string]any
