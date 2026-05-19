@@ -9,7 +9,7 @@ Live API:
 Contract:
 
 - API version: `v1`
-- Admin contract version: `admin-v1`
+- Admin contract version: `admin-mvp-v1`
 - Contract endpoint: `GET /api/contract`
 
 Current endpoints:
@@ -18,14 +18,15 @@ Current endpoints:
 - `GET /api/contract`
 - `POST /api/auth/login`
 - `GET /api/admin/summary`
+- `GET /api/admin/users`
 - `GET /api/admin/members`
+- `POST /api/admin/users/balance`
 - `GET /api/admin/deposits`
 - `POST /api/admin/deposits/confirm`
-
-The non-prefixed endpoints are also supported for simple checks:
-
-- `GET /health`
-- `GET /contract`
+- `GET /api/admin/withdrawals`
+- `POST /api/admin/withdrawals/approve`
+- `POST /api/admin/withdrawals/reject`
+- `GET /api/admin/audit-logs`
 
 Demo login payload:
 
@@ -42,11 +43,19 @@ Successful login returns a Bearer token. Protected endpoints require:
 Authorization: Bearer demo-admin-token
 ```
 
-Compatibility rules:
+Phase 1 admin loop:
 
-- Keep existing endpoint paths and field names stable for `admin-v1`.
-- Add new fields instead of renaming or deleting existing fields.
-- Add a new contract version before making breaking changes.
-- Keep status values stable: member `normal`, `risk_review`; deposit `pending`, `credited`, `risk_review`.
+- Admin login
+- User list
+- Deposit order list and confirm deposit
+- Withdrawal order list and approve/reject withdrawal
+- Manual user balance update
+- Simple operation/audit log
 
-This is still a demo API backed by in-memory data. Database persistence, real authentication, payment callbacks, balance ledger entries, and audit logs should be added before production use.
+Sync rule:
+
+- `ddslot777-admin` must read lists from this API only.
+- After every write action, the admin UI should reload summary, users, deposits, withdrawals, and audit logs from the API.
+- If the API is unavailable, the admin UI should show an error instead of local fallback data.
+
+This is still a demo API backed by in-memory data. Database persistence, real authentication, payment callbacks, balance ledger entries, and durable audit logs should be added before production use.
